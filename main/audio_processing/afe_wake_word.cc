@@ -6,9 +6,21 @@
 #include <arpa/inet.h>
 #include <sstream>
 
+
+#include <esp_afe_sr_models.h>
+#include <esp_nsn_models.h>
+#include "esp_mn_speech_commands.h"
+#include "esp_mn_models.h"
+#include "esp_mn_iface.h"
+
 #define DETECTION_RUNNING_EVENT 1
 
 #define TAG "AfeWakeWord"
+
+TaskHandle_t command_detection_task_ = nullptr;  //新增任务中的定义 我定义为了全局变量
+esp_mn_iface_t *multinet;   //全部定义的全局变量
+model_iface_data_t *model_data;
+afe_fetch_result_t *res;
 
 AfeWakeWord::AfeWakeWord()
     : afe_data_(nullptr),
@@ -30,6 +42,7 @@ AfeWakeWord::~AfeWakeWord() {
     vEventGroupDelete(event_group_);
 }
 
+/*
 void AfeWakeWord::Initialize(AudioCodec* codec) {
     codec_ = codec;
     int ref_num = codec_->input_reference() ? 1 : 0;
@@ -76,6 +89,95 @@ void AfeWakeWord::Initialize(AudioCodec* codec) {
         vTaskDelete(NULL);
     }, "audio_detection", 4096, this, 3, nullptr);
 }
+*/
+
+void AfeWakeWord::Initialize(AudioCodec *codec)
+{
+    codec_ = codec;                                 
+    int ref_num = codec_->input_reference() ? 1 : 0; 
+ 
+    srmodel_list_t *models = esp_srmodel_init("model"); // 初始化语音识别模型列表，从"model"目录加载
+ 
+    // 遍历所有加载的模型
+    for (int i = 0; i < models->num; i++)
+    {                                                            
+        ESP_LOGI(TAG, "Model %d: %s", i, models->model_name[i]); // 打印每个模型的名称
+ 
+        if (strstr(models->model_name[i], ESP_MN_PREFIX) != NULL)   //此处 ESP_MN_PREFIX 为 "mn" 也就是新加的模型库
+        {
+            // 获取 multinet 模型句柄
+            multinet = esp_mn_handle_from_name(models->model_name[i]);
+            if (!multinet)
+            {
+                ESP_LOGI("MULTINET", "failed to create multinet handle");
+                continue;
+            }
+ 
+            //加载模型数据
+            model_data = multinet->create(models->model_name[i], 6000);
+            if (!model_data)
+            {
+                ESP_LOGI("MULTINET", "failed to create model_data handle");
+                continue;
+            }
+        }
+        if (model_data)
+        {
+            //此处使用拼音+空格的方式添加想要自定义的唤醒词
+            esp_mn_commands_clear();
+            esp_mn_commands_add(1, "ni hao yang feng");
+            esp_mn_commands_add(2, "yang feng yang feng");
+            esp_mn_commands_add(3, "yang feng");
+            esp_mn_commands_update();
+        }
+        esp_mn_active_commands_print();  //打印添加的唤醒词
+ 
+        if (strstr(models->model_name[i], ESP_WN_PREFIX) != NULL)
+        {                                                                    
+            wakenet_model_ = models->model_name[i];                         
+            auto words = esp_srmodel_get_wake_words(models, wakenet_model_); 
+            // split by ";" to get all wake words
+            std::stringstream ss(words); 
+            std::string word;
+            while (std::getline(ss, word, ';'))
+            {
+                wake_words_.push_back(word);
+            }
+        }
+    }
+ 
+    std::string input_format; 
+    for (int i = 0; i < codec_->input_channels() - ref_num; i++)
+    {
+        input_format.push_back('M');
+    }
+    for (int i = 0; i < ref_num; i++)
+    {
+        input_format.push_back('R');
+    }
+    afe_config_t *afe_config = afe_config_init(input_format.c_str(), models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+    afe_config->aec_init = codec_->input_reference();
+    afe_config->aec_mode = AEC_MODE_SR_HIGH_PERF;
+    afe_config->afe_perferred_core = 1;
+    afe_config->afe_perferred_priority = 1;
+    afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+ 
+    afe_iface_ = esp_afe_handle_from_config(afe_config);
+    afe_data_ = afe_iface_->create_from_config(afe_config);
+ 
+    xTaskCreate([](void *arg)
+                {
+        auto this_ = (AfeWakeWord*)arg;
+        this_->AudioDetectionTask();
+        vTaskDelete(NULL); }, "audio_detection", 4096, this, 3, nullptr);
+ 
+    //新增一个任务
+    xTaskCreate([](void *arg)
+                {
+        auto this_ = (AfeWakeWord*)arg;
+        this_->CommandDetectionTask();
+        vTaskDelete(NULL); }, "command_detection", 4096, this, 5, &command_detection_task_);
+}
 
 void AfeWakeWord::OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback) {
     wake_word_detected_callback_ = callback;
@@ -119,7 +221,7 @@ void AfeWakeWord::AudioDetectionTask() {
     while (true) {
         xEventGroupWaitBits(event_group_, DETECTION_RUNNING_EVENT, pdFALSE, pdTRUE, portMAX_DELAY);
 
-        auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
+        res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
         if (res == nullptr || res->ret_value == ESP_FAIL) {
             continue;;
         }
@@ -133,6 +235,13 @@ void AfeWakeWord::AudioDetectionTask() {
 
             if (wake_word_detected_callback_) {
                 wake_word_detected_callback_(last_detected_wake_word_);
+            }
+        }        // 通知
+        else if (res->data)
+        {
+            if (model_data)
+            {
+                xTaskNotifyGive(command_detection_task_);
             }
         }
     }
@@ -189,4 +298,47 @@ bool AfeWakeWord::GetWakeWordOpus(std::vector<uint8_t>& opus) {
     opus.swap(wake_word_opus_.front());
     wake_word_opus_.pop_front();
     return !opus.empty();
+}
+
+
+void AfeWakeWord::CommandDetectionTask()
+{
+    while (true)
+    {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY); //阻塞 收到通知后再跑
+ 
+        esp_mn_state_t mn_state;
+        esp_mn_results_t *mn_result;
+ 
+        if (model_data && res->data) //此处res使用的是原本唤醒AudioDetectionTask任务中的res，将其改为全局变量，记得一定要共用一个， afe_fetch_result_t *res; ！ 
+        {
+            mn_state = multinet->detect(model_data, res->data);
+            //判断是否检测到唤醒词
+            if (mn_state == ESP_MN_STATE_DETECTING)
+            {
+                continue;
+            }
+            else if (mn_state == ESP_MN_STATE_DETECTED)
+            {
+                mn_result = multinet->get_results(model_data);
+                //此处id就是你添加唤醒词的id 注意 第一个是0 了，在此处自己可以写个回调函数任意处理 也可以控制其他设备 也可以当作唤醒词处理
+                if (mn_result != nullptr && mn_result->num > 0)
+                {
+                    int command_id = mn_result->phrase_id[0];
+                    if (command_id == 0)
+                    {
+                        Application::GetInstance().WakeWordInvoke("你好杨峰");
+                    }
+                    else if (command_id == 1)
+                    {
+                        Application::GetInstance().WakeWordInvoke("杨峰杨峰");
+                    }
+                    else if (command_id == 2)
+                    {
+                        Application::GetInstance().WakeWordInvoke("杨峰");
+                    }
+                }
+            }
+        }
+    }
 }
